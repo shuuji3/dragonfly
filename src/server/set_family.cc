@@ -52,6 +52,70 @@ intset* IntsetAddSafe(string_view val, intset* is, bool* success, bool* added) {
   return is;
 }
 
+bool dictContains(const dict* d, string_view key) {
+  uint64_t h = dictGenHashFunction(key.data(), key.size());
+
+  for (unsigned table = 0; table <= 1; table++) {
+    uint64_t idx = h & DICTHT_SIZE_MASK(d->ht_size_exp[table]);
+    dictEntry* he = d->ht_table[table][idx];
+    while (he) {
+      sds dkey = (sds)he->key;
+      if (sdslen(dkey) == key.size() && (key.empty() || memcmp(dkey, key.data(), key.size()) == 0))
+        return true;
+      he = he->next;
+    }
+    if (!dictIsRehashing(d))
+      break;
+  }
+  return false;
+}
+
+pair<unsigned, bool> RemoveStrSet(ArgSlice vals, CompactObj* set) {
+  dict* d = (dict*)set->RObjPtr();
+  auto* shard = EngineShard::tlocal();
+  unsigned removed = 0;
+
+  for (auto member : vals) {
+    shard->tmp_str1 = sdscpylen(shard->tmp_str1, member.data(), member.size());
+    int result = dictDelete(d, shard->tmp_str1);
+    removed += (result == DICT_OK);
+  }
+  bool isempty = (dictSize(d) == 0);
+  return make_pair(removed, isempty);
+}
+
+unsigned AddStrSet(ArgSlice vals, CompactObj* dest) {
+  dict* ds = (dict*)dest->RObjPtr();
+  auto* es = EngineShard::tlocal();
+  unsigned res = 0;
+  for (auto member : vals) {
+    es->tmp_str1 = sdscpylen(es->tmp_str1, member.data(), member.size());
+    dictEntry* de = dictAddRaw(ds, es->tmp_str1, NULL);
+    if (de) {
+      de->key = sdsdup(es->tmp_str1);
+      ++res;
+    }
+  }
+  return res;
+}
+
+void InitStrSet(CompactObj* set) {
+  dict* ds = dictCreate(&setDictType);
+  set->InitRobj(OBJ_SET, kEncodingStrMap, ds);
+}
+
+template <typename F> void FillStrSet(F&& f, void* ptr) {
+  dict* ds = (dict*)ptr;
+  string str;
+  dictIterator* di = dictGetIterator(ds);
+  dictEntry* de = nullptr;
+  while ((de = dictNext(di))) {
+    str.assign((sds)de->key, sdslen((sds)de->key));
+    f(move(str));
+  }
+  dictReleaseIterator(di);
+}
+
 // returns (removed, isempty)
 pair<unsigned, bool> RemoveSet(ArgSlice vals, CompactObj* set) {
   bool isempty = false;
@@ -73,14 +137,7 @@ pair<unsigned, bool> RemoveSet(ArgSlice vals, CompactObj* set) {
     isempty = (intsetLen(is) == 0);
     set->SetRObjPtr(is);
   } else {
-    dict* d = (dict*)set->RObjPtr();
-    auto* shard = EngineShard::tlocal();
-    for (auto member : vals) {
-      shard->tmp_str1 = sdscpylen(shard->tmp_str1, member.data(), member.size());
-      int result = dictDelete(d, shard->tmp_str1);
-      removed += (result == DICT_OK);
-    }
-    isempty = (dictSize(d) == 0);
+    return RemoveStrSet(vals, set);
   }
   return make_pair(removed, isempty);
 }
@@ -100,9 +157,112 @@ void InitSet(ArgSlice vals, CompactObj* set) {
     intset* is = intsetNew();
     set->InitRobj(OBJ_SET, kEncodingIntSet, is);
   } else {
-    dict* ds = dictCreate(&setDictType);
-    set->InitRobj(OBJ_SET, kEncodingStrMap, ds);
+    InitStrSet(set);
   }
+}
+
+void ScanCallback(void* privdata, const dictEntry* de) {
+  StringVec* sv = (StringVec*)privdata;
+  sds key = (sds)de->key;
+  sv->push_back(string(key, sdslen(key)));
+}
+
+uint64_t ScanStrSet(const CompactObj& co, uint64_t curs, unsigned count, StringVec* res) {
+  DCHECK_EQ(kEncodingStrMap, co.Encoding());
+  long maxiterations = count * 10;
+
+  dict* ds = (dict*)co.RObjPtr();
+  do {
+    curs = dictScan(ds, curs, ScanCallback, NULL, res);
+  } while (curs && maxiterations-- && res->size() < count);
+
+  return curs;
+}
+
+using SetType = pair<void*, unsigned>;
+
+uint32_t SetTypeLen(const SetType& set) {
+  if (set.second == kEncodingIntSet) {
+    return intsetLen((const intset*)set.first);
+  }
+  DCHECK_EQ(set.second, kEncodingStrMap);
+
+  return dictSize((const dict*)set.first);
+};
+
+bool IsInSet(const SetType& st, int64_t val) {
+  if (st.second == kEncodingIntSet)
+    return intsetFind((intset*)st.first, val);
+
+  DCHECK_EQ(st.second, kEncodingStrMap);
+  char buf[32];
+  char* next = absl::numbers_internal::FastIntToBuffer(val, buf);
+
+  return dictContains((dict*)st.first, string_view{buf, size_t(next - buf)});
+}
+
+bool IsInSet(const SetType& st, string_view member) {
+  if (st.second == kEncodingIntSet) {
+    long long llval;
+    if (!string2ll(member.data(), member.size(), &llval))
+      return false;
+
+    return intsetFind((intset*)st.first, llval);
+  }
+  DCHECK_EQ(st.second, kEncodingStrMap);
+
+  return dictContains((dict*)st.first, member);
+}
+
+// Removes arg from result.
+void DiffStrSet(const SetType& st, absl::flat_hash_set<string>* result) {
+  DCHECK_EQ(kEncodingStrMap, st.second);
+  dict* ds = (dict*)st.first;
+  dictIterator* di = dictGetIterator(ds);
+  dictEntry* de = nullptr;
+  while ((de = dictNext(di))) {
+    sds key = (sds)de->key;
+    result->erase(string_view{key, sdslen(key)});
+  }
+  dictReleaseIterator(di);
+}
+
+void InterStrSet(const vector<SetType>& vec, StringVec* result) {
+  dict* ds = (dict*)vec.front().first;
+  dictIterator* di = dictGetIterator(ds);
+  dictEntry* de = nullptr;
+  while ((de = dictNext(di))) {
+    size_t j = 1;
+    sds key = (sds)de->key;
+    string_view member{key, sdslen(key)};
+
+    for (j = 1; j < vec.size(); j++) {
+      if (vec[j].first != ds && !IsInSet(vec[j], member))
+        break;
+    }
+
+    /* Only take action when all vec contain the member */
+    if (j == vec.size()) {
+      result->push_back(string(member));
+    }
+  }
+  dictReleaseIterator(di);
+}
+
+StringVec PopStrSet(unsigned count, const SetType& st) {
+  StringVec result;
+  dict* ds = (dict*)st.first;
+  string str;
+  dictIterator* di = dictGetSafeIterator(ds);
+  for (uint32_t i = 0; i < count; ++i) {
+    dictEntry* de = dictNext(di);
+    DCHECK(de);
+    result.emplace_back((sds)de->key, sdslen((sds)de->key));
+    dictDelete(ds, de->key);
+  }
+  dictReleaseIterator(di);
+
+  return result;
 }
 
 vector<string> ToVec(absl::flat_hash_set<string>&& set) {
@@ -223,58 +383,6 @@ OpStatus NoOpCb(Transaction* t, EngineShard* shard) {
   return OpStatus::OK;
 };
 
-using SetType = pair<void*, unsigned>;
-
-uint32_t SetTypeLen(const SetType& set) {
-  if (set.second == kEncodingStrMap) {
-    return dictSize((const dict*)set.first);
-  }
-  DCHECK_EQ(set.second, kEncodingIntSet);
-  return intsetLen((const intset*)set.first);
-};
-
-bool dictContains(const dict* d, string_view key) {
-  uint64_t h = dictGenHashFunction(key.data(), key.size());
-
-  for (unsigned table = 0; table <= 1; table++) {
-    uint64_t idx = h & DICTHT_SIZE_MASK(d->ht_size_exp[table]);
-    dictEntry* he = d->ht_table[table][idx];
-    while (he) {
-      sds dkey = (sds)he->key;
-      if (sdslen(dkey) == key.size() && (key.empty() || memcmp(dkey, key.data(), key.size()) == 0))
-        return true;
-      he = he->next;
-    }
-    if (!dictIsRehashing(d))
-      break;
-  }
-  return false;
-}
-
-bool IsInSet(const SetType& st, int64_t val) {
-  if (st.second == kEncodingIntSet)
-    return intsetFind((intset*)st.first, val);
-
-  DCHECK_EQ(st.second, kEncodingStrMap);
-  char buf[32];
-  char* next = absl::numbers_internal::FastIntToBuffer(val, buf);
-
-  return dictContains((dict*)st.first, string_view{buf, size_t(next - buf)});
-}
-
-bool IsInSet(const SetType& st, string_view member) {
-  if (st.second == kEncodingIntSet) {
-    long long llval;
-    if (!string2ll(member.data(), member.size(), &llval))
-      return false;
-
-    return intsetFind((intset*)st.first, llval);
-  }
-  DCHECK_EQ(st.second, kEncodingStrMap);
-
-  return dictContains((dict*)st.first, member);
-}
-
 template <typename F> void FillSet(const SetType& set, F&& f) {
   if (set.second == kEncodingIntSet) {
     intset* is = (intset*)set.first;
@@ -287,15 +395,7 @@ template <typename F> void FillSet(const SetType& set, F&& f) {
       f(string{buf, size_t(next - buf)});
     }
   } else {
-    dict* ds = (dict*)set.first;
-    string str;
-    dictIterator* di = dictGetIterator(ds);
-    dictEntry* de = nullptr;
-    while ((de = dictNext(di))) {
-      str.assign((sds)de->key, sdslen((sds)de->key));
-      f(move(str));
-    }
-    dictReleaseIterator(di);
+    FillStrSet(move(f), set.first);
   }
 }
 
@@ -352,12 +452,15 @@ OpResult<uint32_t> OpAdd(const OpArgs& op_args, std::string_view key, ArgSlice v
       res += added;
 
       if (!success) {
-        dict* ds = dictCreate(&setDictType);
-        SetFamily::ConvertTo(is, ds);
-
         co.SetRObjPtr(is);
-        co.InitRobj(OBJ_SET, kEncodingStrMap, ds);  // 'is' is deleted by co.
-        inner_obj = ds;
+
+        robj tmp;
+        if (!SetFamily::ConvertToStrSet(is, intsetLen(is), &tmp)) {
+          return OpStatus::OUT_OF_MEMORY;
+        }
+        // frees 'is' on a way.
+        co.InitRobj(OBJ_SET, kEncodingStrMap, tmp.ptr);
+        inner_obj = co.RObjPtr();
         break;
       }
     }
@@ -367,16 +470,7 @@ OpResult<uint32_t> OpAdd(const OpArgs& op_args, std::string_view key, ArgSlice v
   }
 
   if (co.Encoding() == kEncodingStrMap) {
-    dict* ds = (dict*)inner_obj;
-
-    for (auto member : vals) {
-      es->tmp_str1 = sdscpylen(es->tmp_str1, member.data(), member.size());
-      dictEntry* de = dictAddRaw(ds, es->tmp_str1, NULL);
-      if (de) {
-        de->key = sdsdup(es->tmp_str1);
-        ++res;
-      }
-    }
+    res = AddStrSet(std::move(vals), &co);
   }
 
   db_slice.PostUpdate(op_args.db_ind, add_res.first);
@@ -494,12 +588,6 @@ OpResult<unsigned> Mover::Commit(Transaction* t) {
   return res;
 }
 
-void ScanCallback(void* privdata, const dictEntry* de) {
-  StringVec* sv = (StringVec*)privdata;
-  sds key = (sds)de->key;
-  sv->push_back(string(key, sdslen(key)));
-}
-
 // Read-only OpUnion op on sets.
 OpResult<StringVec> OpUnion(const OpArgs& op_args, ArgSlice keys) {
   DCHECK(!keys.empty());
@@ -560,15 +648,7 @@ OpResult<StringVec> OpDiff(const OpArgs& op_args, ArgSlice keys) {
         uniques.erase(string_view{buf, size_t(next - buf)});
       }
     } else {
-      DCHECK_EQ(kEncodingStrMap, st2.second);
-      dict* ds = (dict*)st2.first;
-      dictIterator* di = dictGetIterator(ds);
-      dictEntry* de = nullptr;
-      while ((de = dictNext(di))) {
-        sds key = (sds)de->key;
-        uniques.erase(string_view{key, sdslen(key)});
-      }
-      dictReleaseIterator(di);
+      DiffStrSet(st2, &uniques);
     }
   }
 
@@ -642,25 +722,7 @@ OpResult<StringVec> OpInter(const Transaction* t, EngineShard* es, bool remove_f
       }
     }
   } else {
-    dict* ds = (dict*)sets.front().first;
-    dictIterator* di = dictGetIterator(ds);
-    dictEntry* de = nullptr;
-    while ((de = dictNext(di))) {
-      size_t j = 1;
-      sds key = (sds)de->key;
-      string_view member{key, sdslen(key)};
-
-      for (j = 1; j < sets.size(); j++) {
-        if (sets[j].first != ds && !IsInSet(sets[j], member))
-          break;
-      }
-
-      /* Only take action when all sets contain the member */
-      if (j == sets.size()) {
-        result.push_back(string(member));
-      }
-    }
-    dictReleaseIterator(di);
+    InterStrSet(sets, &result);
   }
 
   return result;
@@ -1107,16 +1169,7 @@ OpResult<StringVec> SetFamily::OpPop(const OpArgs& op_args, std::string_view key
       is = intsetTrimTail(is, count);  // now remove last count items
       it->second.SetRObjPtr(is);
     } else {
-      dict* ds = (dict*)st.first;
-      string str;
-      dictIterator* di = dictGetSafeIterator(ds);
-      for (uint32_t i = 0; i < count; ++i) {
-        dictEntry* de = dictNext(di);
-        DCHECK(de);
-        result.emplace_back((sds)de->key, sdslen((sds)de->key));
-        dictDelete(ds, de->key);
-      }
-      dictReleaseIterator(di);
+      result = PopStrSet(count, st);
     }
     db_slice.PostUpdate(op_args.db_ind, it);
   }
@@ -1143,18 +1196,37 @@ OpResult<StringVec> SetFamily::OpScan(const OpArgs& op_args, std::string_view ke
     }
     *cursor = 0;
   } else {
-    DCHECK_EQ(kEncodingStrMap, it->second.Encoding());
-    long maxiterations = count * 10;
-
-    dict* ds = (dict*)it->second.RObjPtr();
-    uint64_t cur = *cursor;
-    do {
-      cur = dictScan(ds, cur, ScanCallback, NULL, &res);
-    } while (cur && maxiterations-- && res.size() < count);
-    *cursor = cur;
+    *cursor = ScanStrSet(it->second, *cursor, count, &res);
   }
 
   return res;
+}
+
+bool SetFamily::ConvertToStrSet(const intset* is, size_t expected_len, robj* dest) {
+  dict* ds = dictCreate(&setDictType);
+
+  if (expected_len) {
+    if (dictTryExpand(ds, expected_len) != DICT_OK) {
+      dictRelease(ds);
+      return false;
+    }
+  }
+
+  int64_t intele;
+  char buf[32];
+
+  /* To add the elements we extract integers and create redis objects */
+  int ii = 0;
+  while (intsetGet(const_cast<intset*>(is), ii++, &intele)) {
+    char* next = absl::numbers_internal::FastIntToBuffer(intele, buf);
+    sds s = sdsnewlen(buf, next - buf);
+    CHECK(dictAddRaw(ds, s, NULL));
+  }
+
+  dest->ptr = ds;
+  dest->encoding = OBJ_ENCODING_HT;
+
+  return true;
 }
 
 using CI = CommandId;
@@ -1180,19 +1252,6 @@ void SetFamily::Register(CommandRegistry* registry) {
 
 uint32_t SetFamily::MaxIntsetEntries() {
   return kMaxIntSetEntries;
-}
-
-void SetFamily::ConvertTo(intset* src, dict* dest) {
-  int64_t intele;
-  char buf[32];
-
-  /* To add the elements we extract integers and create redis objects */
-  int ii = 0;
-  while (intsetGet(src, ii++, &intele)) {
-    char* next = absl::numbers_internal::FastIntToBuffer(intele, buf);
-    sds s = sdsnewlen(buf, next - buf);
-    CHECK(dictAddRaw(dest, s, NULL));
-  }
 }
 
 }  // namespace dfly

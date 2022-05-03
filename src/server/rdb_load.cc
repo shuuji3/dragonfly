@@ -869,16 +869,13 @@ io::Result<robj*> RdbLoader::ReadSet() {
           return Unexpected(errc::duplicate_key);
         }
       } else {
-        dict* ds = dictCreate(&setDictType);
-        if (dictTryExpand((dict*)res->ptr, len) != DICT_OK) {
-          dictRelease(ds);
-          LOG(ERROR) << "OOM in dictTryExpand " << len;
+        intset* is = (intset*)res->ptr;
+        if (!SetFamily::ConvertToStrSet(is, len, res)) {
+          LOG(ERROR) << "OOM in ConvertToStrSet " << len;
+          zfree(is);
           return Unexpected(errc::out_of_memory);
         }
-        SetFamily::ConvertTo((intset*)res->ptr, ds);
-        zfree(res->ptr);
-        res->ptr = ds;
-        res->encoding = OBJ_ENCODING_HT;
+        zfree(is);
       }
     }
 
@@ -918,14 +915,13 @@ io::Result<robj*> RdbLoader::ReadSet() {
   robj* res;
   unsigned len = intsetLen(is);
   if (len > SetFamily::MaxIntsetEntries()) {
-    res = createSetObject();
-    if (len > DICT_HT_INITIAL_SIZE && dictTryExpand((dict*)res->ptr, len) != DICT_OK) {
-      LOG(ERROR) << "OOM in dictTryExpand " << len;
+    res = createObject(OBJ_SET, NULL);
+    if (!SetFamily::ConvertToStrSet(is, len > DICT_HT_INITIAL_SIZE ? len : 0, res)) {
+      zfree(is);
       decrRefCount(res);
+      LOG(ERROR) << "OOM in ConvertToStrSet " << len;
       return Unexpected(errc::out_of_memory);
     }
-    SetFamily::ConvertTo(is, (dict*)res->ptr);
-    zfree(is);
   } else {
     res = createObject(OBJ_SET, is);
     res->encoding = OBJ_ENCODING_INTSET;
