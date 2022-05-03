@@ -75,12 +75,22 @@ class StringSet {
     return FindAround(val, BucketId(hc)) < 2;
   }
 
+  bool Erase(std::string_view val);
+
   iterator begin() {
     return iterator{this, 0};
   }
 
   iterator end() {
     return iterator{};
+  }
+
+  size_t obj_malloc_used() const {
+    return obj_malloc_used_;
+  }
+
+  size_t set_malloc_used() const {
+    return (num_chain_entries_ + entries_.capacity()) * sizeof(Entry);
   }
 
   /// stable scanning api. has the same guarantees as redis scan command.
@@ -105,7 +115,8 @@ class StringSet {
     friend class StringSet;
 
    public:
-    iterator() : owner_(nullptr), entry_(nullptr), bucket_id_(0) {}
+    iterator() : owner_(nullptr), entry_(nullptr), bucket_id_(0) {
+    }
 
     iterator& operator++();
 
@@ -137,7 +148,8 @@ class StringSet {
     friend class StringSet;
 
    public:
-    const_iterator() : owner_(nullptr), entry_(nullptr), bucket_id_(0) {}
+    const_iterator() : owner_(nullptr), entry_(nullptr), bucket_id_(0) {
+    }
 
     const_iterator& operator++();
 
@@ -203,6 +215,15 @@ class StringSet {
   void Link(CompactObj co, uint32_t bid);
   void MoveEntry(Entry* e, uint32_t bid);
 
+  void ShiftLeftIfNeeded(Entry* root) {
+    if (root->next) {
+      root->value = std::move(root->next->value);
+      Entry* tmp = root->next;
+      root->next = root->next->next;
+      Free(tmp);
+    }
+  }
+
   void Free(Entry* e) {
     mr()->deallocate(e, sizeof(Entry), alignof(Entry));
     --num_chain_entries_;
@@ -211,6 +232,7 @@ class StringSet {
   // The rule is - entries can be moved to vicinity as long as they are stored
   // "flat", i.e. not into the linked list. The linked list
   std::pmr::vector<Entry> entries_;
+  size_t obj_malloc_used_ = 0;
   uint32_t size_ = 0;
   uint32_t num_chain_entries_ = 0;
   unsigned capacity_log_ = 0;

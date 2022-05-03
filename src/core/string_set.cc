@@ -27,6 +27,7 @@ StringSet::~StringSet() {
       tmp->Reset();
       Free(tmp);
     }
+    entry.Reset();
   }
   DCHECK_EQ(0u, num_chain_entries_);
 }
@@ -45,7 +46,10 @@ bool StringSet::Add(std::string_view str) {
   if (entries_.empty()) {
     capacity_log_ = kMinSizeShift;
     entries_.resize(kMinSize);
-    entries_[BucketId(hc)].value.SetString(str);
+    auto& e = entries_[BucketId(hc)];
+    e.value.SetString(str);
+    obj_malloc_used_ += e.value.MallocUsed();
+    ++size_;
 
     return true;
   }
@@ -64,6 +68,8 @@ bool StringSet::Add(std::string_view str) {
     if (offs < 2) {
       auto& entry = entries_[bucket_id + offs];
       entry.value.SetString(str);
+      obj_malloc_used_ += entry.value.MallocUsed();
+
       return true;
     }
 
@@ -84,8 +90,12 @@ bool StringSet::Add(std::string_view str) {
   if (bid2 != bucket_id) {
     Link(std::move(dest.value), bid2);
     dest.value.SetString(str);
+    obj_malloc_used_ += dest.value.MallocUsed();
   } else {
-    Link(CompactObj{str}, bucket_id);
+    CompactObj co{str};
+    obj_malloc_used_ += dest.value.MallocUsed();
+
+    Link(move(co), bucket_id);
   }
   return true;
 }
@@ -181,10 +191,8 @@ void StringSet::Grow() {
     }
 
     next = root->next;
-    if (root->IsEmpty() && next) {
-      root->value = std::move(next->value);
-      root->next = next->next;
-      Free(next);
+    if (root->IsEmpty()) {
+      ShiftLeftIfNeeded(root);
     }
   }
 }
@@ -248,7 +256,7 @@ uint32_t StringSet::Scan(uint32_t cursor, const ItemCb& cb) const {
   if (it.entry_ == nullptr)
     return 0;
 
-  if (it.bucket_id_ == bucket_id + 1) { // cover displacement case
+  if (it.bucket_id_ == bucket_id + 1) {  // cover displacement case
     // TODO: we could avoid checking computing HC if we explicitly mark displacement.
     // we have plenty-metadata to do so.
     uint32_t bid = BucketId((*it).HashCode());
@@ -261,6 +269,61 @@ uint32_t StringSet::Scan(uint32_t cursor, const ItemCb& cb) const {
   return it.entry_ ? it.bucket_id_ << (32 - capacity_log_) : 0;
 }
 
+bool StringSet::Erase(std::string_view val) {
+  uint64_t hc = CompactObj::HashCode(val);
+  uint32_t bid = BucketId(hc);
+
+  Entry* current = &entries_[bid];
+
+  if (!current->IsEmpty()) {
+    if (current->value == val) {
+      current->Reset();
+      ShiftLeftIfNeeded(current);
+      --size_;
+      return true;
+    }
+
+    Entry* prev = current;
+    current = current->next;
+    while (current) {
+      if (current->value == val) {
+        current->Reset();
+        prev->next = current->next;
+        Free(current);
+        --size_;
+        return true;
+      }
+      prev = current;
+      current = current->next;
+    }
+  }
+
+  auto& prev = entries_[bid - 1];
+  // TODO: to mark displacement.
+  if (bid && !prev.IsEmpty()) {
+    if (prev.value == val) {
+      obj_malloc_used_ -= prev.value.MallocUsed();
+
+      prev.Reset();
+      ShiftLeftIfNeeded(&prev);
+      --size_;
+      return true;
+    }
+  }
+
+  auto& next = entries_[bid + 1];
+  if (bid + 1 < entries_.size()) {
+    if (next.value == val) {
+      obj_malloc_used_ -= next.value.MallocUsed();
+      next.Reset();
+      ShiftLeftIfNeeded(&next);
+      --size_;
+      return true;
+    }
+  }
+
+  return false;
+}
 
 void StringSet::iterator::SeekNonEmpty() {
   while (bucket_id_ < owner_->entries_.size()) {

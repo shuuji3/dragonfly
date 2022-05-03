@@ -12,6 +12,12 @@
 
 #include "base/gtest.h"
 #include "base/logging.h"
+#include "core/mi_memory_resource.h"
+
+extern "C" {
+#include "redis/zmalloc.h"
+}
+
 
 namespace dfly {
 
@@ -22,6 +28,10 @@ class StringSetTest : public ::testing::Test {
   static void SetUpTestSuite() {
     auto* tlh = mi_heap_get_backing();
     SmallString::InitThreadLocal(tlh);
+
+    static MiMemoryResource mi_resource(tlh);
+    // needed for MallocUsed
+    CompactObj::InitThreadLocal(&mi_resource);
   }
 
   static void TearDownTestSuite() {
@@ -35,6 +45,7 @@ TEST_F(StringSetTest, Basic) {
   EXPECT_TRUE(ss_.Add("bar"));
   EXPECT_FALSE(ss_.Add("foo"));
   EXPECT_FALSE(ss_.Add("bar"));
+  EXPECT_EQ(2, ss_.size());
 }
 
 TEST_F(StringSetTest, Many) {
@@ -57,6 +68,7 @@ TEST_F(StringSetTest, Many) {
 #endif
     }
   }
+  EXPECT_EQ(512, ss_.size());
 
   LOG(INFO) << "max chain factor: " << 100 * max_chain_factor << "%";
   size_t iter_len = 0;
