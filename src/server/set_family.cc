@@ -79,7 +79,7 @@ pair<unsigned, bool> RemoveStrSet(ArgSlice vals, CompactObj* set) {
   if (FLAGS_use_set2) {
     StringSet* ss = (StringSet*)set->RObjPtr();
     for (auto member : vals) {
-      removed += ss->Erase(member);
+      // removed += ss->Erase(member);
     }
     isempty = ss->empty();
   } else {
@@ -133,10 +133,10 @@ void InitStrSet(CompactObj* set) {
 template <typename F> void FillFromStrSet(F&& f, void* ptr) {
   string str;
   if (FLAGS_use_set2) {
-    for (const CompactObj& co : *(StringSet*)ptr) {
+    /*for (const CompactObj& co : *(StringSet*)ptr) {
       co.GetString(&str);
       f(move(str));
-    }
+    }*/
   } else {
     dict* ds = (dict*)ptr;
 
