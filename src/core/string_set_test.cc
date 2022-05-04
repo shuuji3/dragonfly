@@ -64,10 +64,14 @@ TEST_F(StringSetTest, Many) {
   for (unsigned i = 0; i < 8192; ++i) {
     EXPECT_TRUE(ss_.Add(absl::StrCat("xxxxxxxxxxxxxxxxx", i)));
     double chain_usage = double(ss_.num_chain_entries()) / ss_.size();
-    if (chain_usage > max_chain_factor && ss_.size() > 32) {
-      max_chain_factor = chain_usage;
+    unsigned num_empty = ss_.bucket_count() - ss_.num_used_buckets();
+    double empty_factor = double(num_empty) / ss_.bucket_count();
+    size_t sz = ss_.size();
+    bool is_log = (sz & (sz + 1)) == 0;
+    if (is_log) {
+      max_chain_factor = empty_factor;
       LOG(INFO) << "max_chain_factor: " << 100 * max_chain_factor << "% at " << ss_.size();
-#if 1
+#if 0
       if (ss_.size() == 15) {
         for (unsigned i = 0; i < ss_.bucket_count(); ++i) {
           LOG(INFO) << "[" << i << "]: " << ss_.BucketDepth(i);

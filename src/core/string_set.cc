@@ -19,6 +19,13 @@ using namespace std;
 
 constexpr size_t kMinSizeShift = 2;
 constexpr size_t kMinSize = 1 << kMinSizeShift;
+constexpr size_t kAllowDisplacements = true;
+
+inline bool CanSetFlat(int offs) {
+  if (kAllowDisplacements)
+    return offs < 2;
+  return offs == 0;
+}
 
 StringSet::StringSet(pmr::memory_resource* mr) : entries_(mr) {
 }
@@ -79,6 +86,7 @@ bool StringSet::Add(std::string_view str) {
     auto& e = entries_[BucketId(hc)];
     obj_malloc_used_ += e.SetString(str);
     ++size_;
+    ++num_used_buckets_;
 
     return true;
   }
@@ -94,12 +102,13 @@ bool StringSet::Add(std::string_view str) {
   // if utilization is too high.
   for (unsigned j = 0; j < 2; ++j) {
     int offs = FindEmptyAround(bucket_id);
-    if (offs < 2) {
+    if (CanSetFlat(offs)) {
       auto& entry = entries_[bucket_id + offs];
       obj_malloc_used_ += entry.SetString(str);
       if (offs != 0) {
         entry.SetDisplaced();
       }
+      ++num_used_buckets_;
       return true;
     }
 
@@ -116,16 +125,19 @@ bool StringSet::Add(std::string_view str) {
     sds sptr = dest.GetSds();
     uint32_t nbid = BucketId(sptr);
     Link(SuperPtr{sptr}, nbid);
+
     if (dest.IsSds()) {
       obj_malloc_used_ += dest.SetString(str);
     } else {
       LinkKey* lk = (LinkKey*)dest.get();
       obj_malloc_used_ += lk->SetString(str);
+      dest.ClearDisplaced();
     }
   } else {
     LinkKey* lk = NewLink(str, dest);
     dest.SetLink(lk);
   }
+  DCHECK(!dest.IsDisplaced());
   return true;
 }
 
@@ -235,23 +247,20 @@ void StringSet::Grow() {
         sp = (sds)current->get();
       }
 
-      // todo: debug code
-      /*string_view sv{sp, sdslen(sp)};
-      uint64_t hc = CompactObj::HashCode(sv);
-      uint32_t pbid = (hc >> (65 - capacity_log_));
-      DCHECK(pbid == i || (entries_[i].IsDisplaced() && (i == pbid + 1 || i == pbid - 1)));*/
       uint32_t bid = BucketId(sp);
       if (bid != uint32_t(i)) {
         int offs = FindEmptyAround(bid);
-        if (offs < 2) {
+        if (CanSetFlat(offs)) {
           auto& dest = entries_[bid + offs];
           DCHECK(!dest.IsLink());
 
           dest.ptr = sp;
           if (offs != 0)
             dest.SetDisplaced();
-          if (lk)
+          if (lk) {
             Free(lk);
+          }
+          ++num_used_buckets_;
         } else {
           Link(*current, bid);
         }
@@ -279,7 +288,19 @@ void StringSet::Grow() {
         Free(lk);
       }
     }
+
+    if (entries_[i].IsEmpty()) {
+      --num_used_buckets_;
+    }
   }
+
+#if 0
+  unsigned cnt = 0;
+  for (auto ptr : entries_) {
+    cnt += (!ptr.IsEmpty());
+  }
+  DCHECK_EQ(num_used_buckets_, cnt);
+#endif
 }
 
 void StringSet::Link(SuperPtr ptr, uint32_t bid) {
@@ -288,6 +309,9 @@ void StringSet::Link(SuperPtr ptr, uint32_t bid) {
 
   bool is_root_displaced = root.IsDisplaced();
 
+  if (is_root_displaced) {
+    DCHECK_NE(bid, BucketId(root.GetSds()));
+  }
   LinkKey* head;
   void* val;
 

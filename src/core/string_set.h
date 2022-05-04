@@ -11,14 +11,40 @@ extern "C" {
 
 namespace dfly {
 
+// StringSet is a nice but over-optimized data-structure. Probably is not worth it in the first
+// place but sometimes the OCD kicks in and one can not resist.
+// The advantage of it over redis-dict is smaller meta-data waste.
+// dictEntry is 24 bytes, i.e it uses at least 32N bytes where N is the expected length.
+// dict requires to allocate dictEntry per each addition in addition to the supplied key.
+// It also wastes space in case of a set because it stores a value pointer inside dictEntry.
+// To summarize, for a fully utilized hash-table
+// dict uses N*(24) + N*8 = 32*N bytes not including the key space.
+//
+// This class uses 8 bytes per bucket (similarly to dictEntry*) but it used it for both
+// links and keys. For most cases, we remove the need for another redirection layer
+// and just store the key, so no "dictEntry" allocations occur.
+// For those cells that require chaining, the bucket is
+// changed in run-time to represent a linked chain.
+// Additional feature - in order to to reduce collisions, we insert items into
+// neighbour cells but only if they are empty (not chains). This way we reduce the number of
+// empty (unused) spaces right before resize from 36% to ~21%.
+// For a fully utilized table we use N*8 + 0.2N*16 = 11.2*N bytes or ~20 bytes savings.
+// TODO: to separate hash/compare functions from table logic and make it generic
+// with potential replacements of hset/zset data structures.
+// static_assert(sizeof(dictEntry) == 24);
+
 class StringSet {
   struct LinkKey;
-  static constexpr size_t kLinkBit = 1ULL << 63;
-  static constexpr size_t kDisplaceBit = 1ULL << 62;
-  static constexpr size_t kTagMask = kLinkBit | kDisplaceBit;
+  // we can assume that high 12 bits of user address space
+  // can be used for tagging. At most 52 bits of address are reserved for
+  // some configurations, and usually it's 48 bits.
+  // https://www.kernel.org/doc/html/latest/arm64/memory.html
+  static constexpr size_t kLinkBit = 1ULL << 52;
+  static constexpr size_t kDisplaceBit = 1ULL << 53;
+  static constexpr size_t kTagMask = 4095ULL << 51; // we reserve 12 high bits.
 
   struct SuperPtr {
-    void* ptr = nullptr;
+    void* ptr = nullptr;  //
 
     explicit SuperPtr(void* p = nullptr) : ptr(p) {
     }
@@ -113,6 +139,10 @@ class StringSet {
   // those that are chained to the entries stored inline in the bucket array.
   size_t num_chain_entries() const {
     return num_chain_entries_;
+  }
+
+  size_t num_used_buckets() const {
+    return num_used_buckets_;
   }
 
   bool Contains(std::string_view val) const;
@@ -269,6 +299,7 @@ class StringSet {
   size_t obj_malloc_used_ = 0;
   uint32_t size_ = 0;
   uint32_t num_chain_entries_ = 0;
+  uint32_t num_used_buckets_ = 0;
   unsigned capacity_log_ = 0;
 };
 
