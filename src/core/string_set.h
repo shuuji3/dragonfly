@@ -17,8 +17,9 @@ namespace dfly {
 // dictEntry is 24 bytes, i.e it uses at least 32N bytes where N is the expected length.
 // dict requires to allocate dictEntry per each addition in addition to the supplied key.
 // It also wastes space in case of a set because it stores a value pointer inside dictEntry.
-// To summarize, for a fully utilized hash-table
-// dict uses N*(24) + N*8 = 32*N bytes not including the key space.
+// To summarize:
+// 100% utilized dict uses N*24 + N*8 = 32N bytes not including the key space.
+// for 75% utilization (1/0.75 buckets): N*1.33*8 + N*24 = 35N
 //
 // This class uses 8 bytes per bucket (similarly to dictEntry*) but it used it for both
 // links and keys. For most cases, we remove the need for another redirection layer
@@ -27,8 +28,9 @@ namespace dfly {
 // changed in run-time to represent a linked chain.
 // Additional feature - in order to to reduce collisions, we insert items into
 // neighbour cells but only if they are empty (not chains). This way we reduce the number of
-// empty (unused) spaces right before resize from 36% to ~21%.
-// For a fully utilized table we use N*8 + 0.2N*16 = 11.2*N bytes or ~20 bytes savings.
+// empty (unused) spaces at full utilization from 36% to ~21%.
+// 100% utilized table requires: N*8 + 0.2N*16 = 11.2N bytes or ~20 bytes savings.
+// 75% utilization: N*1.33*8 + 0.12N*16 = 13N or ~22 bytes savings per record.
 // TODO: to separate hash/compare functions from table logic and make it generic
 // with potential replacements of hset/zset data structures.
 // static_assert(sizeof(dictEntry) == 24);

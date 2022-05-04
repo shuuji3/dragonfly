@@ -63,14 +63,15 @@ TEST_F(StringSetTest, Many) {
   double max_chain_factor = 0;
   for (unsigned i = 0; i < 8192; ++i) {
     EXPECT_TRUE(ss_.Add(absl::StrCat("xxxxxxxxxxxxxxxxx", i)));
-    double chain_usage = double(ss_.num_chain_entries()) / ss_.size();
-    unsigned num_empty = ss_.bucket_count() - ss_.num_used_buckets();
-    double empty_factor = double(num_empty) / ss_.bucket_count();
     size_t sz = ss_.size();
-    bool is_log = (sz & (sz + 1)) == 0;
-    if (is_log) {
-      max_chain_factor = empty_factor;
-      LOG(INFO) << "max_chain_factor: " << 100 * max_chain_factor << "% at " << ss_.size();
+    bool should_print = (sz == ss_.bucket_count()) || (sz == ss_.bucket_count() * 0.75);
+    if (should_print) {
+      double chain_usage = double(ss_.num_chain_entries()) / ss_.size();
+      unsigned num_empty = ss_.bucket_count() - ss_.num_used_buckets();
+      double empty_factor = double(num_empty) / ss_.bucket_count();
+
+      LOG(INFO) << "chains: " << 100 * chain_usage << ", empty: " << 100 * empty_factor << "% at "
+                << ss_.size();
 #if 0
       if (ss_.size() == 15) {
         for (unsigned i = 0; i < ss_.bucket_count(); ++i) {
